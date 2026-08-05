@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+paho-mqtt
+sqlalchemy
+google-auth
+google-api-python-client
+pydantic
+python-socketio
