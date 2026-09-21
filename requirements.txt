@@ -1,8 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 paho-mqtt
 sqlalchemy
-google-auth
-google-api-python-client
 pydantic
 python-socketio
+google-auth
+google-api-python-client

@@ -1,0 +1,26 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite Database (biar db lokal ga ikut ter-commit ke Git)
+*.db
+*.sqlite3
+geosense.db
+
+# Virtual Environment (jika ada)
+venv/
+.venv/
+env/
+
+# Environment Variables / Secrets
+.env
+
+# IDE / Editor Settings
+.vscode/
+.idea/
+*.swp
+
+# OS junk files
+.DS_Store
+Thumbs.db
