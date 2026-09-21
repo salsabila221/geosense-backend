@@ -3,11 +3,13 @@ import json
 import ssl
 import asyncio
 import base64
+from typing import Optional
 from pydantic import BaseModel
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import socketio
 import paho.mqtt.client as mqtt
+import random
 
 # ---------------------------------------------------------
 # 1. INISIALISASI FASTAPI & SOCKET.IO
@@ -26,7 +28,6 @@ sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 loop = None
 mqtt_client = None
 
-
 # ---------------------------------------------------------
 # 2. INTEGRASI HIVEMQ CLOUD (MQTT CLIENT)
 # ---------------------------------------------------------
@@ -34,7 +35,6 @@ MQTT_BROKER = "3cd0f777a8ec4a20af722dd1214f7eb3.s1.eu.hivemq.cloud"
 MQTT_PORT = 8883
 MQTT_TOPIC = "geosense/data"
 
-# Menyesuaikan Signature Callback Paho-MQTT v2
 def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         print("✅ FastAPI terhubung ke HiveMQ Cloud Broker!")
@@ -48,7 +48,7 @@ def on_message(client, userdata, msg):
         payload_str = msg.payload.decode('utf-8')
         data_payload = json.loads(payload_str)
         
-        # Kirim data secara async ke Socket.IO (Frontend React)
+        # Kirim data secara async ke Socket.IO
         if loop and loop.is_running():
             asyncio.run_coroutine_threadsafe(
                 sio.emit('geosense_update', data_payload), loop
@@ -58,9 +58,11 @@ def on_message(client, userdata, msg):
 
 def setup_mqtt():
     global mqtt_client
+    # Gunakan Client ID dinamis seperti di Node.js agar tidak tumbukan saat restart
+    random_id = hex(random.getrandbits(24))[2:]
     mqtt_client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2, 
-        client_id="fastapi_geosense_backend"
+        client_id=f"fastapi_geosense_{random_id}"
     )
     mqtt_client.username_pw_set("Kelom2", "TCPRule1")
     mqtt_client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLSv1_2)
@@ -79,7 +81,7 @@ def setup_mqtt():
 @fastapi_app.on_event("startup")
 async def startup_event():
     global loop
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop() # Ambil loop yang sedang aktif
     setup_mqtt()
 
 @fastapi_app.on_event("shutdown")
@@ -105,8 +107,9 @@ async def disconnect(sid):
 def root():
     return {"status": "Server Backend GeoSense FastAPI Aktif 🚀"}
 
+# Samakan dengan Express: menerima status melalui Query Parameter (?status=...)
 @fastapi_app.post("/api/admin/override")
-async def admin_override(status: str):
+async def admin_override(status: str = Query(...)):
     print(f"⚠️ Admin Emergency Override dipicu ke status: {status}")
     
     override_payload = {
@@ -120,66 +123,6 @@ async def admin_override(status: str):
     
     await sio.emit('geosense_update', override_payload)
     return {"success": True, "message": f"Status diubah ke {status}"}
-
-# =========================================================
-# 🔑 GOOGLE AUTHENTICATION & USER ROLE MANAGEMENT
-# =========================================================
-
-ADMIN_EMAILS = [
-    "salsabila@gmail.com",
-    "admin@geosense.com"
-]
-
-class GoogleAuthRequest(BaseModel):
-    credential: str
-
-class GoogleRegisterRequest(BaseModel):
-    email: str
-    fullname: str
-    telegram: str
-
-def decode_google_jwt(token: str) -> dict:
-    try:
-        payload_b64 = token.split('.')[1]
-        payload_b64 += '=' * (-len(payload_b64) % 4)
-        payload_json = base64.b64decode(payload_b64).decode('utf-8')
-        return json.loads(payload_json)
-    except Exception as e:
-        print("⚠️ Gagal decode JWT:", e)
-        return {}
-
-@fastapi_app.post("/api/auth/google")
-async def google_auth(data: GoogleAuthRequest):
-    user_info = decode_google_jwt(data.credential)
-    user_email = user_info.get("email", "").lower()
-    user_name = user_info.get("name", "User")
-    
-    if not user_email:
-        return {"error": "Token Google tidak valid atau gagal didecode"}
-
-    is_admin = any(user_email == admin_email.lower() for admin_email in ADMIN_EMAILS)
-    assigned_role = "admin" if is_admin else "user"
-    
-    print(f"🔑 Auth Login: {user_email} -> Role: {assigned_role}")
-    
-    return {
-        "success": True,
-        "message": "Authentication berhasil",
-        "email": user_email,
-        "name": user_name,
-        "is_admin": is_admin,
-        "role": assigned_role,
-        "is_new_user": False
-    }
-
-@fastapi_app.post("/api/auth/google/register")
-async def google_register(data: GoogleRegisterRequest):
-    print(f"📝 Registrasi User Baru: {data.fullname} ({data.email}) - Telegram: {data.telegram}")
-    
-    return {
-        "success": True,
-        "message": "Data registrasi berhasil disimpan"
-    }
 
 # ---------------------------------------------------------
 # 4. BINDING FASTAPI + SOCKET.IO UNTUK UVICORN
