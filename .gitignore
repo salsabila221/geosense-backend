@@ -15,6 +15,11 @@ env/
 
 # Environment Variables / Secrets
 .env
+# Kunci privat Web Push (VAPID) — jangan di-commit
+vapid_private.pem
+
+# Log lokal
+*.log
 
 # IDE / Editor Settings
 .vscode/

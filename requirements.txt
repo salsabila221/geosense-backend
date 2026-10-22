@@ -6,3 +6,7 @@ pydantic
 python-socketio
 google-auth
 google-api-python-client
+python-dotenv
+PyJWT
+psycopg2-binary
+pywebpush
