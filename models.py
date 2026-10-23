@@ -1,8 +1,12 @@
 import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, Integer, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 
 from database import Base
+
+# JSONB di Supabase/Postgres, JSON biasa di SQLite (untuk testing lokal).
+JSONPayload = JSON().with_variant(JSONB, "postgresql")
 
 
 class User(Base):
@@ -140,4 +144,148 @@ class NotificationLog(Base):
             "success": self.success,
             "detail": self.detail,
             "created_at": created.isoformat() if created else None,
+        }
+
+
+class MqttMessage(Base):
+    """
+    Arsip mentah SETIAP pesan MQTT (rawdata / gpsdata).
+
+    Tabel ini sengaja menyimpan payload asli (text + JSON kalau valid) supaya
+    tidak ada data yang hilang walaupun format dari device berubah.
+    """
+
+    __tablename__ = "mqtt_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    topic = Column(String(255), nullable=False, index=True)
+    message_type = Column(String(32), nullable=False, default="unknown", index=True)
+    node_id = Column(String(64), nullable=True, index=True)
+
+    received_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    source_timestamp = Column(DateTime, nullable=True, index=True)
+
+    payload_text = Column(Text, nullable=False)
+    payload_json = Column(JSONPayload, nullable=True)
+    error = Column(Text, nullable=True)
+
+    def to_public_dict(self, include_payload: bool = True) -> dict:
+        received = self.received_at
+        if received and received.tzinfo is None:
+            received = received.replace(tzinfo=datetime.timezone.utc)
+        source = self.source_timestamp
+        if source and source.tzinfo is None:
+            source = source.replace(tzinfo=datetime.timezone.utc)
+        data = {
+            "id": self.id,
+            "topic": self.topic,
+            "message_type": self.message_type,
+            "node_id": self.node_id,
+            "received_at": received.isoformat() if received else None,
+            "source_timestamp": source.isoformat() if source else None,
+            "error": self.error,
+        }
+        if include_payload:
+            data["payload"] = self.payload_json
+            data["payload_text"] = self.payload_text
+        return data
+
+
+class NodeTelemetry(Base):
+    """Satu baris per node per pesan MQTT (data geofon dan/atau GPS)."""
+
+    __tablename__ = "node_telemetry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    mqtt_message_id = Column(Integer, nullable=True, index=True)
+    node_id = Column(String(64), nullable=False, index=True)
+    topic = Column(String(255), nullable=False, index=True)
+    message_type = Column(String(32), nullable=False, default="unknown", index=True)
+
+    received_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    source_timestamp = Column(DateTime, nullable=True, index=True)
+
+    online = Column(Boolean, nullable=True)
+    status = Column(String(32), nullable=True)
+    aktivitas = Column(String(64), nullable=True)
+
+    p2p = Column(Float, nullable=True)
+    rms = Column(Float, nullable=True)
+    peak = Column(Float, nullable=True)
+    signal = Column(JSONPayload, nullable=True)
+
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    altitude = Column(Float, nullable=True)
+    satellites = Column(Integer, nullable=True)
+    hdop = Column(Float, nullable=True)
+    gps_fix = Column(Boolean, nullable=True)
+
+    raw_data = Column(JSONPayload, nullable=True)
+
+    def to_public_dict(self) -> dict:
+        received = self.received_at
+        if received and received.tzinfo is None:
+            received = received.replace(tzinfo=datetime.timezone.utc)
+        return {
+            "id": self.id,
+            "mqtt_message_id": self.mqtt_message_id,
+            "node_id": self.node_id,
+            "topic": self.topic,
+            "message_type": self.message_type,
+            "received_at": received.isoformat() if received else None,
+            "online": self.online,
+            "status": self.status,
+            "aktivitas": self.aktivitas,
+            "p2p": self.p2p,
+            "rms": self.rms,
+            "peak": self.peak,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "altitude": self.altitude,
+            "satellites": self.satellites,
+            "hdop": self.hdop,
+            "gps_fix": self.gps_fix,
+        }
+
+
+class EventLocation(Base):
+    """Hasil triangulasi/TDOA dan arah longsor dari pesan MQTT."""
+
+    __tablename__ = "event_locations"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    mqtt_message_id = Column(Integer, nullable=True, index=True)
+    received_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
+    source_timestamp = Column(DateTime, nullable=True, index=True)
+
+    x = Column(Float, nullable=True)
+    y = Column(Float, nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    estimated_latitude = Column(Float, nullable=True)
+    estimated_longitude = Column(Float, nullable=True)
+    bearing_degrees = Column(Float, nullable=True)
+    compass = Column(String(32), nullable=True)
+    direction_source = Column(String(64), nullable=True)
+
+    raw_data = Column(JSONPayload, nullable=True)
+
+    def to_public_dict(self) -> dict:
+        received = self.received_at
+        if received and received.tzinfo is None:
+            received = received.replace(tzinfo=datetime.timezone.utc)
+        return {
+            "id": self.id,
+            "mqtt_message_id": self.mqtt_message_id,
+            "received_at": received.isoformat() if received else None,
+            "x": self.x,
+            "y": self.y,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "estimated_latitude": self.estimated_latitude,
+            "estimated_longitude": self.estimated_longitude,
+            "bearing_degrees": self.bearing_degrees,
+            "compass": self.compass,
+            "direction_source": self.direction_source,
         }

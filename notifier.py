@@ -38,6 +38,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 FONNTE_URL = os.getenv("FONNTE_URL", "https://api.fonnte.com/send").strip()
+FONNTE_DEVICE_URL = os.getenv("FONNTE_DEVICE_URL", "https://api.fonnte.com/device").strip()
 FONNTE_TOKEN = os.getenv("FONNTE_TOKEN", "").strip()
 WA_ENABLED = os.getenv("WA_ENABLED", "1").strip() == "1"
 APP_URL = os.getenv("APP_URL", "http://localhost:5173").strip()
@@ -86,6 +87,73 @@ def enabled() -> bool:
     return WA_ENABLED and bool(FONNTE_TOKEN)
 
 
+def device_info() -> dict:
+    """Cek status device Fonnte tanpa mengirim pesan (untuk diagnosis)."""
+    if not FONNTE_TOKEN:
+        return {
+            "success": False,
+            "connected": False,
+            "device_status": None,
+            "error": "FONNTE_TOKEN belum diset",
+        }
+
+    request = urllib.request.Request(
+        FONNTE_DEVICE_URL,
+        headers={"Authorization": FONNTE_TOKEN},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace") or str(exc)
+        return {
+            "success": False,
+            "connected": False,
+            "device_status": None,
+            "http_status": exc.code,
+            "error": raw[:500],
+        }
+    except Exception as exc:  # timeout, DNS, dll.
+        return {
+            "success": False,
+            "connected": False,
+            "device_status": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "connected": False,
+            "device_status": None,
+            "error": raw[:500],
+        }
+
+    if not isinstance(data, dict):
+        return {
+            "success": False,
+            "connected": False,
+            "device_status": None,
+            "error": "Respons device Fonnte tidak dikenali",
+        }
+
+    device_status = str(data.get("device_status") or "").strip().lower() or None
+    return {
+        "success": bool(data.get("status")),
+        "connected": device_status == "connect",
+        "device_status": device_status,
+        "device": data.get("device"),
+        "name": data.get("name"),
+        "package": data.get("package"),
+        "quota": data.get("quota"),
+        "expired": data.get("expired"),
+        "messages": data.get("messages"),
+    }
+
+
 def normalize_status(value) -> str:
     return str(value or "").strip().upper()
 
@@ -131,7 +199,7 @@ def build_message(
     sumber = "Model ML (otomatis)" if source == "ml" else f"Override Admin ({changed_by or 'admin'})"
 
     lines = [
-        f"{meta['emoji']} *PERINGATAN DINI GEOSENSE*",
+        f"{meta['emoji']} *PERINGATAN PERGERAKAN TANAH GEOSENSE*",
         "",
         f"Halo {fullname or 'Pengguna GeoSense'},",
         f"Status sistem berubah menjadi *{status}*.",
@@ -252,6 +320,17 @@ def _broadcast(status: str, source: str, context: dict) -> None:
         print("ℹ️ Notifikasi WA: tidak ada user dengan nomor WhatsApp.")
         return
 
+    device = device_info()
+    if device.get("device_status") and not device.get("connected"):
+        detail = json.dumps(device, ensure_ascii=False)
+        print(
+            f"❌ Notifikasi WA '{status}' dibatalkan: device Fonnte "
+            f"{device.get('device_status')} (bukan connect)."
+        )
+        for phone, _fullname in recipients:
+            _log(phone, status, source, False, detail)
+        return
+
     print(f"📤 Notifikasi WA '{status}' ke {len(recipients)} nomor...")
     for phone, fullname in recipients:
         message = build_message(
@@ -328,6 +407,16 @@ def send_test(phone: str) -> tuple[bool, dict]:
     target = _target(phone)
     if not re.fullmatch(r"628[1-9]\d{6,11}", target):
         return False, {"error": "Nomor tidak valid. Contoh: 08123456789"}
+
+    device = device_info()
+    if device.get("device_status") and not device.get("connected"):
+        return False, {
+            "error": (
+                "Device Fonnte sedang terputus. Buka dashboard Fonnte, "
+                "lalu scan QR ulang sampai status device menjadi Connected."
+            ),
+            **device,
+        }
 
     message = "\n".join(
         [
