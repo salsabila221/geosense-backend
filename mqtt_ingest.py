@@ -65,6 +65,32 @@ def message_type_from_topic(topic: str) -> str:
     }[topic_kind(topic)]
 
 
+def message_type_from_payload(payload: Any, topic: str = "") -> str:
+    """
+    Tentukan tipe pesan dari topik, dengan fallback ke isi payload.
+
+    Firmware GPS mengirim ``{"n": "NODE01", "type": "gps", ...}``. Kalau
+    topiknya tidak dikenali, field ``type`` (atau adanya array sampel ``d``)
+    dipakai supaya pesan tetap tercatat dengan tipe yang benar.
+    """
+    kind = message_type_from_topic(topic)
+    if kind != "unknown":
+        return kind
+
+    if isinstance(payload, dict):
+        marker = str(payload.get("type") or payload.get("kind") or "").strip().lower()
+        if marker in {"gps", "gnss", "gpsdata", "position", "location"}:
+            return "gpsdata"
+        if marker in {"raw", "rawdata", "geophone", "geofon", "vibration", "getaran"}:
+            return "rawdata"
+        for key in ("d", "signal", "samples", "waveform", "data"):
+            value = payload.get(key)
+            if isinstance(value, (list, tuple)) and value:
+                return "rawdata"
+
+    return kind
+
+
 def parse_payload(raw_text: str) -> Any | None:
     """Parse JSON; kembalikan None kalau payload bukan JSON."""
     try:
@@ -86,7 +112,17 @@ def node_id_from_mapping(mapping: dict) -> str | None:
     if not isinstance(mapping, dict):
         return None
 
-    for key in ("node_id", "sensor_id", "node", "geophone", "geofon", "sensor", "device_id"):
+    # ``n`` adalah kunci singkat yang dipakai firmware: {"n": "NODE01", ...}.
+    for key in (
+        "node_id",
+        "sensor_id",
+        "node",
+        "geophone",
+        "geofon",
+        "sensor",
+        "device_id",
+        "n",
+    ):
         value = mapping.get(key)
         token = telemetry.node_id_from_token(value)
         if token:
@@ -283,7 +319,7 @@ def extract_meta(payload: Any) -> dict:
         ),
         "p2p_amplitude": _number(payload, "p2p_amplitude", "p2p", "p2p_mv"),
         "rms": _number(payload, "rms", "rms_amplitude"),
-        "timestamp": extract_timestamp(payload),
+        "timestamp": extract_timestamp(payload, include_gps_time=False),
     }
 
     for key in ("data", "payload", "message", "telemetry"):
@@ -297,10 +333,23 @@ def extract_meta(payload: Any) -> dict:
     return meta
 
 
-def extract_timestamp(payload: Any) -> datetime.datetime | None:
+def extract_timestamp(
+    payload: Any, *, include_gps_time: bool = True
+) -> datetime.datetime | None:
+    """
+    Ambil timestamp sumber dari payload.
+
+    ``utc``/``gps_time`` (waktu GPS device) dipakai sebagai ``source_timestamp``
+    di database. Untuk timestamp dashboard, panggil dengan
+    ``include_gps_time=False`` supaya display tidak membeku di waktu GPS
+    terakhir saat pesan geofon terus masuk.
+    """
     if not isinstance(payload, dict):
         return None
-    for key in ("timestamp", "time", "ts", "datetime", "received_at", "created_at"):
+    keys = ("timestamp", "time", "ts", "datetime", "received_at", "created_at")
+    if include_gps_time:
+        keys = keys + ("utc", "gps_time")
+    for key in keys:
         if key in payload:
             parsed = parse_timestamp(payload.get(key))
             if parsed:
@@ -308,7 +357,7 @@ def extract_timestamp(payload: Any) -> datetime.datetime | None:
     for key in ("data", "payload", "message", "telemetry"):
         nested = payload.get(key)
         if isinstance(nested, dict):
-            parsed = extract_timestamp(nested)
+            parsed = extract_timestamp(nested, include_gps_time=include_gps_time)
             if parsed:
                 return parsed
     return None
@@ -365,6 +414,7 @@ def persist_message(
     message_type: str,
     records: dict[str, dict],
     location: dict | None,
+    node_id: str | None = None,
     error: str | None = None,
     received_at: datetime.datetime | None = None,
 ) -> int | None:
@@ -380,7 +430,15 @@ def persist_message(
     message = models.MqttMessage(
         topic=topic,
         message_type=message_type,
-        node_id=next(iter(records)) if len(records) == 1 else None,
+        node_id=(
+            telemetry.canonical_node_id(node_id)
+            if node_id
+            else (
+                telemetry.canonical_node_id(next(iter(records)))
+                if len(records) == 1
+                else None
+            )
+        ),
         received_at=received_at,
         source_timestamp=source_timestamp,
         payload_text=raw_text,

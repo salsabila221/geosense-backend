@@ -37,6 +37,7 @@ for _stream in (sys.stdout, sys.stderr):
 # Import modul database & model
 import auth
 import database
+import event_ingest
 import models
 import mqtt_ingest
 import notifier
@@ -76,9 +77,12 @@ CORS_ORIGINS = [
 ]
 # Saat dev, Vite kadang pindah ke 5174/5175 dst. Regex ini bikin origin localhost
 # (port apa pun) tetap diizinkan tanpa perlu edit .env terus.
-CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", r"http://(localhost|127\.0\.0\.1)(:\d+)?")
+CORS_ORIGIN_REGEX = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"http://(localhost|127\.0\.0\.1)(:\d+)?|https://([a-z0-9-]+\.)*vercel\.app",
+)
 
-MQTT_BROKER = os.getenv("MQTT_BROKER", "3cd0f777a8ec4a20af722dd1214f7eb3.s1.eu.hivemq.cloud")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "35f0ff8245ed4c5c8d3838dc3bd1ba62.s1.eu.hivemq.cloud")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "rawdata,gpsdata")
 MQTT_TOPICS = [
@@ -86,7 +90,7 @@ MQTT_TOPICS = [
     for topic in os.getenv("MQTT_TOPICS", MQTT_TOPIC).split(",")
     if topic.strip()
 ]
-MQTT_USERNAME = os.getenv("MQTT_USERNAME", "geosense-process")
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 
 # Global State Variables
@@ -100,6 +104,7 @@ latest_nodes: dict[str, dict] = {}
 latest_location: dict | None = None
 latest_topics: set[str] = set()
 latest_update_type: str | None = None
+event_assembler = event_ingest.EventAssembler()
 latest_meta = {
     "status": None,
     "kondisi_tanah": None,
@@ -162,7 +167,7 @@ def restore_telemetry_state() -> None:
             db.query(func.max(models.NodeTelemetry.id).label("id"))
             .filter(
                 models.NodeTelemetry.node_id.in_(telemetry.NODE_KEYS),
-                models.NodeTelemetry.message_type.in_(("rawdata", "gpsdata")),
+                models.NodeTelemetry.message_type.in_(("rawdata", "gpsdata", "event")),
             )
             .group_by(
                 models.NodeTelemetry.node_id,
@@ -181,10 +186,13 @@ def restore_telemetry_state() -> None:
 
         for node_id in telemetry.NODE_KEYS:
             raw_row = latest_by_key.get((node_id, "rawdata"))
+            event_row = latest_by_key.get((node_id, "event"))
             gps_row = latest_by_key.get((node_id, "gpsdata"))
             record: dict = {}
-            if raw_row:
-                record.update(_node_record_from_row(raw_row))
+            base_rows = [row for row in (raw_row, event_row) if row is not None]
+            if base_rows:
+                base_row = max(base_rows, key=lambda row: row.id)
+                record.update(_node_record_from_row(base_row))
             if gps_row:
                 gps_record = _node_record_from_row(gps_row)
                 if isinstance(gps_record.get("gps"), dict):
@@ -229,35 +237,39 @@ def restore_telemetry_state() -> None:
             .filter(models.SystemStatus.id == 1)
             .first()
         )
-        raw_rows = [
+        base_rows = [
             row for (_node_id, message_type), row in latest_by_key.items()
-            if message_type == "rawdata"
+            if message_type in ("rawdata", "event")
         ]
-        last_raw = max(raw_rows, key=lambda row: row.id) if raw_rows else None
+        last_base = max(base_rows, key=lambda row: row.id) if base_rows else None
 
         with telemetry_lock:
             latest_nodes.clear()
             latest_nodes.update(restored_nodes)
             latest_location = location
             latest_topics.clear()
+            has_event = any(
+                (node_id, "event") in latest_by_key
+                for node_id in restored_nodes
+            )
             if restored_nodes:
                 latest_topics.add("rawdata")
+            if has_event:
+                latest_topics.add("event")
             if any(isinstance(node.get("gps"), dict) for node in restored_nodes.values()):
                 latest_topics.add("gpsdata")
             latest_meta["status"] = normalize_status(sys_status.status) if sys_status else None
             if restored_nodes:
-                has_raw = any(
-                    (node_id, "rawdata") in latest_by_key
-                    for node_id in restored_nodes
+                latest_update_type = (
+                    last_base.message_type if last_base else "gpsdata"
                 )
-                latest_update_type = "rawdata" if has_raw else "gpsdata"
             else:
                 latest_update_type = None
-            if last_raw:
-                latest_meta["aktivitas"] = last_raw.aktivitas
-                latest_meta["p2p_amplitude"] = last_raw.p2p
-                latest_meta["rms"] = last_raw.rms
-                latest_meta["timestamp"] = _epoch(last_raw.received_at)
+            if last_base:
+                latest_meta["aktivitas"] = last_base.aktivitas
+                latest_meta["p2p_amplitude"] = last_base.p2p
+                latest_meta["rms"] = last_base.rms
+                latest_meta["timestamp"] = _epoch(last_base.received_at)
     except Exception as exc:
         print("⚠️ Gagal memuat state telemetri terakhir:", exc)
     finally:
@@ -269,6 +281,7 @@ def merge_telemetry_state(
     meta: dict,
     location: dict | None,
     topic: str,
+    message_type: str | None = None,
 ) -> None:
     global latest_location, latest_update_type
     with telemetry_lock:
@@ -286,7 +299,7 @@ def merge_telemetry_state(
         if location:
             latest_location = copy.deepcopy(location)
         latest_topics.add(topic)
-        latest_update_type = mqtt_ingest.message_type_from_topic(topic)
+        latest_update_type = message_type or mqtt_ingest.message_type_from_topic(topic)
 
 
 def build_dashboard_payload() -> dict:
@@ -307,6 +320,15 @@ def build_dashboard_payload() -> dict:
     if meta.get("p2p_amplitude") is None and node_p2p:
         meta["p2p_amplitude"] = max(node_p2p)
 
+    # Event waveform membawa periode sampel; frontend memakainya untuk label
+    # sumbu waktu.
+    sampling_rate = None
+    for node in nodes.values():
+        period = to_float(node.get("sample_period_us"))
+        if period and period > 0:
+            sampling_rate = round(1_000_000.0 / period, 4)
+            break
+
     payload = {
         "timestamp": meta.get("timestamp") or int(time.time()),
         "status": normalize_status(meta.get("status")) or "AMAN",
@@ -314,6 +336,8 @@ def build_dashboard_payload() -> dict:
         "source_topics": topics,
         "update_type": update_type or "unknown",
     }
+    if sampling_rate:
+        payload["sampling_rate"] = sampling_rate
     for key in ("kondisi_tanah", "aktivitas", "p2p_amplitude", "rms"):
         if meta.get(key) is not None:
             payload[key] = meta[key]
@@ -378,7 +402,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
     if _reason_code_value(rc) == 0:
         print("✅ FastAPI terhubung ke HiveMQ Cloud Broker!")
         for topic in MQTT_TOPICS:
-            result, _mid = client.subscribe(topic)
+            result, _mid = client.subscribe(topic, qos=1)
             if _reason_code_value(result) == mqtt.MQTT_ERR_SUCCESS:
                 print(f"📥 FastAPI Subscribed ke topik: '{topic}'")
             else:
@@ -459,8 +483,27 @@ def on_message(client, userdata, msg):
     topic = getattr(msg, "topic", "") or ""
     received_at = datetime.datetime.utcnow()
     raw_text = msg.payload.decode("utf-8", errors="replace")
-    message_type = mqtt_ingest.message_type_from_topic(topic)
     payload = mqtt_ingest.parse_payload(raw_text)
+
+    # Protokol baru: node mengirim satu event waveform (bisa utuh atau
+    # terpecah menjadi EVENT_META/DATA/EVENT_END).
+    event_message = event_ingest.parse_message(payload)
+    event: dict | None = None
+    frame: dict | None = None
+    if event_message:
+        mode, parsed = event_message
+        if mode == "complete":
+            event = event_ingest.complete_event(parsed)
+        else:
+            frame = parsed
+
+    is_event = event_message is not None
+    message_type = "event" if is_event else mqtt_ingest.message_type_from_payload(payload, topic)
+    node_id = (
+        (event or {}).get("node_id")
+        or (frame or {}).get("node_id")
+        or None
+    )
 
     records: dict[str, dict] = {}
     location: dict | None = None
@@ -473,7 +516,7 @@ def on_message(client, userdata, msg):
             f"⚠️ MQTT '{topic}': payload non-JSON tetap disimpan "
             f"({len(msg.payload)} bytes)"
         )
-    else:
+    elif not is_event:
         records = mqtt_ingest.enrich_records(
             mqtt_ingest.extract_records(payload, topic)
         )
@@ -491,18 +534,32 @@ def on_message(client, userdata, msg):
     # 1. Simpan SEMUA pesan MQTT ke Supabase, termasuk yang gagal di-parse.
     #    Ini sengaja dilakukan sebelum broadcast supaya data tidak hilang.
     db = database.SessionLocal()
+    message_id = None
     try:
-        mqtt_ingest.persist_message(
+        message_id = mqtt_ingest.persist_message(
             db,
             topic=topic,
             raw_text=raw_text,
             payload=payload,
             message_type=message_type,
-            records=records,
-            location=location,
+            records={} if is_event else records,
+            location=None if is_event else location,
+            node_id=node_id,
             error=parse_error,
             received_at=received_at,
         )
+        if frame is not None:
+            event = event_assembler.feed(frame)
+        if event is not None and event_assembler.mark_finalized(event):
+            event_ingest.persist_event(
+                db,
+                topic=topic,
+                record=event,
+                mqtt_message_id=message_id,
+                received_at=received_at,
+            )
+        elif event is not None:
+            event = None
     except Exception as db_err:
         print(f"❌ Gagal menyimpan MQTT '{topic}' ke Supabase:", db_err)
         db.rollback()
@@ -511,6 +568,15 @@ def on_message(client, userdata, msg):
 
     if payload is None:
         return
+
+    if is_event:
+        if event is None:
+            # Frame sudah masuk buffer / event duplikat.
+            return
+        records = {event["node_id"]: {k: v for k, v in event.items() if k != "node_id"}}
+        event_time = mqtt_ingest.parse_timestamp(event.get("event_utc"))
+        meta = {"timestamp": event_time} if event_time else {}
+        location = None
 
     has_update = bool(
         records
@@ -525,7 +591,7 @@ def on_message(client, userdata, msg):
         return
 
     # 2. Gabungkan rawdata + gpsdata per node, lalu susun payload dashboard.
-    merge_telemetry_state(records, meta, location, topic)
+    merge_telemetry_state(records, meta, location, topic, message_type)
     data_payload = build_dashboard_payload()
 
     # 3. Update status terkini + catat ke riwayat kalau statusnya berubah.
@@ -998,7 +1064,9 @@ def telemetry_messages(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     topic: Optional[str] = Query(None),
-    message_type: Optional[str] = Query(None, description="rawdata | gpsdata | processed"),
+    message_type: Optional[str] = Query(
+        None, description="rawdata | gpsdata | processed | event"
+    ),
     include_payload: bool = Query(False),
     _: models.User = Depends(auth.require_admin),
     db: Session = Depends(database.get_db),
@@ -1023,6 +1091,54 @@ def telemetry_messages(
         "limit": limit,
         "offset": offset,
         "items": [row.to_public_dict(include_payload=include_payload) for row in rows],
+    }
+
+
+# ---- Event waveform (admin) ----
+@fastapi_app.get("/api/admin/events")
+def telemetry_events(
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    node_id: Optional[str] = Query(None),
+    include_signal: bool = Query(False),
+    _: models.User = Depends(auth.require_admin),
+    db: Session = Depends(database.get_db),
+):
+    """
+    Event waveform yang sudah dirangkai (EVENT_META/DATA/EVENT_END).
+
+    Metadata event ada di ``event``; waveform penuh hanya dikirim kalau
+    ``include_signal=true`` (900 sampel bisa besar).
+    """
+    query = db.query(models.NodeTelemetry).filter(
+        models.NodeTelemetry.message_type == "event"
+    )
+    if node_id:
+        query = query.filter(
+            models.NodeTelemetry.node_id == telemetry.canonical_node_id(node_id)
+        )
+
+    total = query.count()
+    rows = (
+        query.order_by(models.NodeTelemetry.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    items = []
+    for row in rows:
+        item = row.to_public_dict()
+        item["event"] = row.raw_data if isinstance(row.raw_data, dict) else {}
+        if include_signal:
+            item["signal"] = row.signal
+        items.append(item)
+
+    return {
+        "success": True,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": items,
     }
 
 

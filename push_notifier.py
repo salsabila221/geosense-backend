@@ -189,7 +189,10 @@ def send_to_all(payload: dict) -> dict:
         except WebPushException as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             failed += 1
-            if status_code in (404, 410):
+            # 404/410 = subscription mati. 400/401/403 biasanya subscription
+            # dibuat dengan VAPID key lama / malformed; hapus supaya perangkat
+            # bisa subscribe ulang dengan key yang benar.
+            if status_code in (400, 401, 403, 404, 410):
                 _delete_subscription(item["id"])
                 removed += 1
             print(f"Push gagal ({status_code}) untuk {item['endpoint'][:48]}...: {exc}")

@@ -76,7 +76,7 @@ _LON_KEYS = (
     "lng_deg",
 )
 _ALT_KEYS = ("altitude", "alt", "elevation", "elevasi")
-_SAT_KEYS = ("satellites", "sats", "num_sats", "sat_count", "satelit")
+_SAT_KEYS = ("satellites", "sats", "sat", "num_sats", "sat_count", "satelit")
 _HDOP_KEYS = ("hdop", "horizontal_dilution", "accuracy")
 _FIX_KEYS = ("fix", "valid", "has_fix", "gps_fix", "fixed")
 
@@ -240,17 +240,15 @@ def _extract_gps(node: dict) -> dict | None:
 
 
 def _canonical_node_key(key: str, index: int) -> str:
-    text = str(key or "").strip().lower()
-    if text in NODE_KEYS:
-        return text
-    match = re.search(r"([1-9]\d*)$", text)
-    if match and 1 <= int(match.group(1)) <= 3:
-        return f"geo_{int(match.group(1))}"
+    token = node_id_from_token(key)
+    if token:
+        return token
     return f"geo_{index + 1}"
 
 
+# Menerima 'geo_1', 'geofon-1', 'node 1', 'NODE01', 'sensor2', atau '1'.
 _NODE_TOKEN_RE = re.compile(
-    r"^(?:(?:geo|geofon|node|sensor)[-_ ]?)?([1-9]\d*)$",
+    r"^(?:(?:geo|geofon|node|sensor|n)[-_ ]?)?0*([1-9]\d*)$",
     re.IGNORECASE,
 )
 

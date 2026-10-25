@@ -1,23 +1,67 @@
 # Format Telemetri GPS + Geofon
 
+> **Protokol baru (event waveform):** node STM32 sekarang mengirim satu event
+> (`EVENT_META` → `DATA` → `EVENT_END`) berisi waveform denoised dalam ADC
+> counts, bukan ringkasan RMS per paket. Backend mendukung event utuh maupun
+> frame terpisah. Lihat [`EVENT_WAVEFORM.md`](EVENT_WAVEFORM.md) dan
+> `C:\geosense-processing\LORA_PROTOCOL.md`.
+
+## Format asli firmware (dipakai sekarang)
+
+Firmware mengirim dua payload terpisah, masing-masing satu node per pesan.
+Kunci `n` berisi nama node (`NODE01`, `NODE02`, `NODE03`) dan otomatis
+dinormalisasi menjadi `geo_1`, `geo_2`, `geo_3`.
+
+Geofon (`rawdata`):
+
+```json
+{"n":"NODE01","p":27,"t":50843,"d":[0.00012,0.00143,37.97,0.00034,0.00000,0.00096,0.00000]}
+```
+
+| Field | Arti |
+|---|---|
+| `n` | ID node (`NODE01` → `geo_1`) |
+| `p` | Nomor urut paket dari device |
+| `t` | Uptime device dalam milidetik (bukan epoch) |
+| `d` | Sampel getaran; backend menghitung `p2p`, `rms`, `peak`, dan `signal` |
+
+GPS (`gpsdata`):
+
+```json
+{"n":"NODE01","type":"gps","lat":-6.900000,"lon":107.600000,"sat":8,"hdop":1.2,"utc":"2026-10-23T04:30:00Z","uptime_ms":60000}
+```
+
+| Field | Arti |
+|---|---|
+| `n` | ID node (`NODE01` → `geo_1`) |
+| `type` | `gps`, dipakai sebagai penentu tipe kalau topik tidak dikenali |
+| `lat` / `lon` | Koordinat desimal derajat |
+| `sat` | Jumlah satelit |
+| `hdop` | Akurasi horizontal |
+| `utc` | Waktu GPS; dipakai sebagai `source_timestamp` |
+| `uptime_ms` | Uptime device dalam milidetik |
+
+Backend menggabungkan keduanya per node: nilai `p2p`/`rms`/`signal` dari
+`rawdata` dan `gps` dari `gpsdata` akan tampil bersama di dashboard.
+
 ## Topik MQTT
 
-Backend subscribe dua topik terpisah:
+Backend subscribe tiga topik:
 
 | Topik | Isi |
 |---|---|
-| `rawdata` | Data geofon: `p2p`, `rms`, `peak`, `signal`, status, aktivitas, dan `location` TDOA |
+| `rawdata` | Event waveform (`EVENT_META`/`DATA`/`EVENT_END`) atau data geofon lama: `p2p`, `rms`, `signal` |
 | `gpsdata` | GPS per node: `latitude`, `longitude`, `altitude`, `satellites`, `hdop`, `fix` |
-
-Pisahkan dengan koma di `.env`:
+| `geosense/data` | Hasil processing: TDOA (`location.x/y`), statistik node, aktivitas |
 
 ```env
-MQTT_TOPIC=rawdata,gpsdata
+MQTT_TOPIC=rawdata,gpsdata,geosense/data
 ```
 
-`rawdata` dan `gpsdata` boleh datang kapan saja. Backend menyimpan state
-terakhir per node lalu menggabungkannya sebelum mengirim `geosense_update` ke
-dashboard. Jadi GPS tidak harus berada dalam pesan yang sama dengan geofon.
+Pisahkan topik dengan koma. `rawdata`, `gpsdata`, dan hasil processing boleh
+datang kapan saja; backend menyimpan state terakhir per node lalu
+menggabungkannya sebelum mengirim `geosense_update` ke dashboard. Jadi GPS dan
+hasil TDOA tidak harus berada dalam pesan yang sama dengan waveform.
 
 ## Contoh pesan `gpsdata`
 
@@ -137,6 +181,9 @@ Backend menormalkan beberapa variasi nama field:
 
 - GPS di dalam `node.gps` / `node.gnss` / `node.position`
 - GPS langsung di node: `latitude`/`longitude`, `lat`/`lon`/`lng`
+- Jumlah satelit: `satellites`, `sats`, `sat`, `num_sats`
+- Timestamp GPS: `utc` (ISO 8601) atau epoch (`timestamp`/`ts`)
+- ID node singkat: `n` (`NODE01` → `geo_1`)
 - `gps_latitude`/`gps_longitude`
 - Peta GPS terpisah di level atas: `gps`, `node_gps`, `gps_data`, `gps_nodes`
 - Koordinat berupa angka, string desimal, atau format `6.9 S` / `107.6 E`
